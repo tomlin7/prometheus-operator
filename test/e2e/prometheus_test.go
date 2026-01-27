@@ -47,8 +47,11 @@ import (
 	certutil "k8s.io/client-go/util/cert"
 	"k8s.io/utils/ptr"
 
+	"k8s.io/apimachinery/pkg/types"
+
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"github.com/prometheus-operator/prometheus-operator/pkg/operator"
+	operatorFramework "github.com/prometheus-operator/prometheus-operator/test/framework"
 	testFramework "github.com/prometheus-operator/prometheus-operator/test/framework"
 )
 
@@ -4883,7 +4886,7 @@ func testPrometheusCRDValidation(t *testing.T) {
 				CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
 					Replicas: &replicas,
 					UpdateStrategy: &monitoringv1.StatefulSetUpdateStrategy{
-						Type: monitoringv1.StatefulSetUpdateStrategyType(""),
+						Type: appsv1.StatefulSetUpdateStrategyType(""),
 					},
 				},
 			},
@@ -4895,7 +4898,7 @@ func testPrometheusCRDValidation(t *testing.T) {
 				CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
 					Replicas: &replicas,
 					UpdateStrategy: &monitoringv1.StatefulSetUpdateStrategy{
-						Type:          monitoringv1.OnDeleteStatefulSetStrategyType,
+						Type:          appsv1.OnDeleteStatefulSetStrategyType,
 						RollingUpdate: &monitoringv1.RollingUpdateStatefulSetStrategy{},
 					},
 				},
@@ -6110,4 +6113,107 @@ type alertmanagerDiscovery struct {
 type prometheusAlertmanagerAPIResponse struct {
 	Status string                 `json:"status"`
 	Data   *alertmanagerDiscovery `json:"data"`
+}
+
+// testStuckStatefulSetRolloutWithRepairPolicy ensures that the repair policy
+// (DeleteNotReadyPods) actively deletes pods that are stuck during a rollout.
+func testStuckStatefulSetRolloutWithRepairPolicy(t *testing.T) {
+	t.Parallel()
+
+	testCtx := framework.NewTestCtx(t)
+	defer testCtx.Cleanup(t)
+	ns := framework.CreateNamespace(context.Background(), t, testCtx)
+
+	// Create a dedicated operator with the repair policy enabled.
+	finalizers, err := framework.CreateOrUpdatePrometheusOperatorWithOpts(
+		context.Background(),
+		operatorFramework.PrometheusOperatorOpts{
+			Namespace:           ns,
+			ClusterRoleBindings: true,
+			AdditionalArgs:      []string{"--repair-policy-for-stuck-statefulsets=delete"},
+		},
+	)
+	require.NoError(t, err)
+	for _, f := range finalizers {
+		testCtx.AddFinalizerFn(f)
+	}
+
+	framework.SetupPrometheusRBAC(context.Background(), t, testCtx, ns)
+
+	p := framework.MakeBasicPrometheus(ns, "statefulset-repair", "test", 2)
+	p.Spec.PodManagementPolicy = ptr.To(monitoringv1.OrderedReadyPodManagement)
+	// We no longer set RepairPolicy in the spec as it's now a global CLI flag.
+
+	prom, err := framework.CreatePrometheusAndWaitUntilReady(
+		context.Background(),
+		ns,
+		p,
+	)
+	require.NoError(t, err)
+
+	badImage := "quay.io/prometheus/prometheus:foobar"
+	prom, err = framework.PatchPrometheus(
+		context.Background(),
+		prom.Name,
+		prom.Namespace,
+		monitoringv1.PrometheusSpec{
+			CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+				Image: &badImage,
+			},
+		},
+	)
+	require.NoError(t, err)
+
+	// Wait for the upper pod to be created with the bad image and get stuck.
+	// We expect the operator to delete it repeatedly.
+	var initialUID types.UID
+	podName := "prometheus-" + prom.Name + "-1"
+	ctx := context.Background()
+
+	// First wait for the pod to pick up the change
+	err = wait.PollUntilContextTimeout(ctx, time.Second, framework.DefaultTimeout, true, func(ctx context.Context) (bool, error) {
+		pod, err := framework.KubeClient.CoreV1().Pods(prom.Namespace).Get(ctx, podName, metav1.GetOptions{})
+		if err != nil {
+			return false, nil
+		}
+
+		// Check if it has the bad image
+		found := false
+		for _, container := range pod.Spec.Containers {
+			if container.Image == badImage {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false, nil
+		}
+
+		if initialUID == "" {
+			initialUID = pod.UID
+			return false, nil // Continue polling to see if UID changes
+		}
+
+		// If UID changed, it means it was deleted and recreated
+		if pod.UID != initialUID {
+			t.Logf("Pod %s was deleted and recreated (UID changed from %s to %s)", podName, initialUID, pod.UID)
+			return true, nil
+		}
+
+		return false, nil
+	})
+	require.NoError(t, err, "expected stuck pod to be deleted by repair policy")
+
+	// Fix the bad image location and ensure that the resource goes back to ready.
+	prom, err = framework.PatchPrometheusAndWaitUntilReady(
+		context.Background(),
+		prom.Name,
+		prom.Namespace,
+		monitoringv1.PrometheusSpec{
+			CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+				Image: ptr.To(operator.DefaultPrometheusImage),
+			},
+		},
+	)
+	require.NoError(t, err)
 }
